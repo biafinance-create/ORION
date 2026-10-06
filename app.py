@@ -64,7 +64,7 @@ IBOV_TICKERS = {
     "CPFE3.SA": "CPFE3.SA - CPFL ENERGIA ON",
     "CMIN3.SA": "CMIN3.SA - CSN MINERAÇÃO ON",
     "CURY3.SA": "CURY3.SA - CURY ON",
-    "CYRE3.SA": "CYRE3.SA - CYRELA ON",
+    "CYRE3.SA": "CYRELA ON",
     "DIRR3.SA": "DIRR3.SA - DIRECIONAL ON",
     "ENGI11.SA": "ENGI11.SA - ENERGISA UNT",
     "EGIE3.SA": "EGIE3.SA - ENGIE BRASIL ON",
@@ -90,11 +90,17 @@ IBOV_TICKERS = {
     "YDUQ3.SA": "YDUQ3.SA - YDUQS ON"
 }
 
+HORIZON_MAP = {
+    "1 Dia (1D)": {"periods": 1, "threshold": 0.002},
+    "1 Semana (1S)": {"periods": 5, "threshold": 0.008},
+    "1 Mês (1M)": {"periods": 21, "threshold": 0.020}
+}
+
 # ==========================================
-# ENGENHARIA DE FEATURES
+# ENGENHARIA DE FEATURES (TENDÊNCIA, MOMENTUM, VOLATILIDADE)
 # ==========================================
 @st.cache_data
-def load_and_build_features(ticker: str):
+def load_and_build_features(ticker: str, forward_periods: int, threshold: float):
     start_date = "2020-01-01"
     end_date = "2026-10-01"
     df = yf.download(ticker, start=start_date, end=end_date)
@@ -131,16 +137,14 @@ def load_and_build_features(ticker: str):
     data['atr_pct'] = atr / data['Close']
     data['vol_ratio'] = atr / (atr.rolling(50).mean() + 1e-9)
 
-    # TARGET (Alta nos próximos 3 períodos acima de 0.5%)
-    FORWARD_PERIODS = 3
-    THRESHOLD = 0.005
-    future_return = data['Close'].shift(-FORWARD_PERIODS) / data['Close'] - 1
-    data['target'] = (future_return > THRESHOLD).astype(int)
+    # TARGET (Dinamicamente configurado pelo horizonte selecionado)
+    future_return = data['Close'].shift(-forward_periods) / data['Close'] - 1
+    data['target'] = (future_return > threshold).astype(int)
 
     return data.dropna()
 
 # ==========================================
-# BARRA LATERAL (APENAS SELEÇÃO DA AÇÃO)
+# BARRA LATERAL (SELEÇÃO DE ATIVO E HORIZONTE TEMPORAL)
 # ==========================================
 st.sidebar.header("Seleção do Ativo")
 selected_label = st.sidebar.selectbox(
@@ -149,8 +153,15 @@ selected_label = st.sidebar.selectbox(
     index=0
 )
 
-# Recupera a chave do ticker (ex: "PETR4.SA")
+st.sidebar.header("Horizonte Temporal da Previsão")
+selected_horizon = st.sidebar.radio(
+    "Escolha a probabilidade alvo:",
+    options=list(HORIZON_MAP.keys()),
+    index=1  # Padrão: 1 Semana
+)
+
 selected_ticker = [k for k, v in IBOV_TICKERS.items() if v == selected_label][0]
+horizon_config = HORIZON_MAP[selected_horizon]
 
 # Parâmetros padrão otimizados
 proba_threshold = 0.60
@@ -158,10 +169,14 @@ atr_multiplier = 1.5
 risk_reward = 2.0
 
 # ==========================================
-# EXECUÇÃO AUTOMÁTICA
+# EXECUÇÃO AUTOMÁTICA DO MODELO
 # ==========================================
-with st.spinner(f"Analisando {selected_label} com XGBoost..."):
-    df_data = load_and_build_features(selected_ticker)
+with st.spinner(f"Calculando modelo XGBoost ({selected_horizon}) para {selected_label}..."):
+    df_data = load_and_build_features(
+        selected_ticker,
+        forward_periods=horizon_config["periods"],
+        threshold=horizon_config["threshold"]
+    )
 
     if df_data.empty:
         st.error("Não foram encontrados dados para este ativo.")
@@ -217,17 +232,17 @@ with st.spinner(f"Analisando {selected_label} com XGBoost..."):
         df_trades = pd.DataFrame(trades)
 
         # --- EXIBIÇÃO DE RESULTADOS ---
-        st.subheader(f"Análise Quantitativa: {selected_label}")
+        st.subheader(f"Análise Preditiva ({selected_horizon}): {selected_label}")
         
         last_proba = df_test['proba_alta'].iloc[-1]
         col1, col2, col3 = st.columns(3)
         col1.metric("Último Fechamento", f"R$ {df_test['Close'].iloc[-1]:.2f}")
-        col2.metric("Probabilidade de Alta (XGBoost)", f"{last_proba*100:.1f}%")
+        col2.metric(f"Probabilidade de Alta em {selected_horizon}", f"{last_proba*100:.1f}%")
         
         if last_proba >= proba_threshold:
-            col3.success("🟢 SINAL DE COMPRA ATIVO")
+            col3.success(f"🟢 SINAL DE COMPRA ATIVO ({selected_horizon})")
         else:
-            col3.info("⚪ AGUARDAR FORA DO MERCADO")
+            col3.info(f"⚪ AGUARDAR FORA DO MERCADO")
 
         st.divider()
 
@@ -235,19 +250,19 @@ with st.spinner(f"Analisando {selected_label} com XGBoost..."):
             win_rate = (df_trades['Outcome'] == 'Take Profit').mean() * 100
             cum_return = (1 + df_trades['Return']).prod() - 1
             
-            st.subheader("Resultados do Backtest (Fora da Amostra / Teste)")
+            st.subheader(f"Resultados do Backtest Out-of-Sample ({selected_horizon})")
             m1, m2, m3 = st.columns(3)
             m1.metric("Total de Trades", len(df_trades))
             m2.metric("Taxa de Acerto (Win Rate)", f"{win_rate:.1f}%")
             m3.metric("Retorno Acumulado", f"{cum_return*100:.2f}%")
 
             df_trades['Equity'] = (1 + df_trades['Return']).cumprod()
-            fig_eq = px.line(df_trades, x='Exit Date', y='Equity', title="Curva de Patrimônio do Backtest")
+            fig_eq = px.line(df_trades, x='Exit Date', y='Equity', title=f"Curva de Patrimônio do Backtest ({selected_horizon})")
             st.plotly_chart(fig_eq, use_container_width=True)
         else:
-            st.warning("Nenhum trade disparado no período de teste para este ativo.")
+            st.warning(f"Nenhum trade disparado no período de teste para o horizonte de {selected_horizon}.")
 
-        st.subheader("Importância das Variáveis no Modelo")
+        st.subheader("Importância dos Indicadores no Modelo")
         imp = pd.Series(model.feature_importances_, index=feature_cols).reset_index()
         imp.columns = ['Indicador', 'Importância']
         fig_imp = px.bar(imp, x='Importância', y='Indicador', orientation='h')
